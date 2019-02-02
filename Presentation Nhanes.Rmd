@@ -1,0 +1,1263 @@
+---
+title: "Modele predicitve Nhanes"
+output: html_notebook
+---
+
+## Webscrapping
+Pour le jeu de donnée que nous avons obtenu, les variables et les facteurs sont désignés à l'aide des codes, rendant la compréhension peu évident. Ainsi nous sommes ammenés à transcodifier toutes ces codes par leur signification. Pour cela, nous avons webscrappé sur le site de nhanes tous les libellés associés aux codes.
+
+```{r,echo=FALSE}
+don <- read.csv("F:/nhanesv2/data/var_lib.csv")
+don$X <- NULL
+print(don[1:15,])
+```
+
+La table de correspondance entre les libelles et les codes comporte 2291 enregistrements.
+```{r, echo=False}
+dim(don)
+```
+
+## transcodificatipn
+la table correspondance code / signification sont utile ensuite pour mettre le jeu de donnée 
+
+## Etude hypertension
+```{r, echo=FALSE, message=FALSE, include=FALSE}
+############################################################################
+# Etude sur la prediction hypertension
+############################################################################
+library(glmnet)#contrainte
+library(randomForest)#Foret
+library(gbm)#Boosting
+library(e1071)#SVM
+library(rpart)#Arbre
+library(foreach)#parallel
+
+don <- read.csv("data/nhanes_hyper_mice.csv")
+don$X <- NULL
+levels(don$Y) <- c(0,1)
+
+XX <- as.matrix(model.matrix(~.,don)[,-ncol(model.matrix(~.,don))])
+YY <- as.matrix(model.matrix(~.,don)[,ncol(model.matrix(~.,don))])
+
+bloc <- 4
+ind= sample(1:nrow(don) %% 4+1)
+res <- data.frame(Y=don$Y, log=0, ridge=0, lasso=0, elastic=0,
+                  foret=0, adabo=0, logibo=0, svm=0, pm=0, arbre=0)
+set.seed(1234)
+deb <-   Sys.time()
+foreach (i = 1:bloc, .packages = c("gbm","e1071","glmnet","randomForest", "rpart")) %dopar% {
+  # logisque
+  mod <- glm(Y~.,data=don[ind!=i,],family="binomial")
+  res[ind==i,"log"] <- predict(mod,don[ind==i,],type="response")
+  XXA <- XX[ind!=i,]
+  YYA <- YY[ind!=i,]
+  XXT <- XX[ind==i,]
+  # ridge
+  tmp <- cv.glmnet(XXA,YYA,alpha=0,family="binomial")
+  mod <- glmnet(XXA,YYA,alpha=0,lambda=tmp$lambda.min, family="binomial")
+  res[ind==i,"ridge"] <- predict(mod,newx=XXT,type="response")
+  # lass0
+  tmp <- cv.glmnet(XXA,YYA, alpha=1, family="binomial")
+  mod <- glmnet(XXA,YYA,alpha=1, lambda =tmp$lambda.1se,family="binomial" )
+  res[ind==i,"lasso"] <- predict(mod,newx=XXT, type="response")
+  # elasticnet
+  tmp <- cv.glmnet(XXA,YYA, alpha=0.5, family="binomial")
+  mod <- glmnet(XXA,YYA,alpha = 0.5, lambda = tmp$lambda.min, family="binomial")
+  res[ind==i,"elastic"] <- predict(mod,newx=XXT,type="response")
+  # foret
+  mod <- randomForest(Y~., data = don[ind!=i,], ntree=500)
+  res[ind==i, "foret"] <- predict(mod, don[ind==i,], type="prob")[,2]
+  # Adaboost
+  tmp <- gbm(as.numeric(Y)-1~.,data = don[ind!=i,], distribution = "adaboost", interaction.depth = 2,
+             shrinkage = 0.1,n.trees = 500)
+  M <- gbm.perf(tmp)[1]
+  mod <- gbm(as.numeric(Y)-1~.,data = don[ind!=i,], distribution = "adaboost", interaction.depth = 2,
+             shrinkage = 0.1,n.trees = M)
+  res[ind==i, "adabo"] <- predict(mod, newdata=don[ind==i,], type = "response", n.trees = M)
+  # Logiboost
+  tmp <- gbm(as.numeric(Y)-1~.,data=don[ind!=i,], distribution="bernoulli", interaction.depth = 2,
+             shrinkage=0.1,n.trees=500)
+  M <- gbm.perf(tmp)[1]
+  mod <- gbm(as.numeric(Y)-1~.,data=don[ind!=i,], distribution="bernoulli", interaction.depth = 2,
+             shrinkage=0.1,n.trees=M)
+  res[ind==i, "logibo"] <- predict(mod,newdata=don[ind==i,], type= "response", n.trees = M)
+  # SVM
+  mod <- svm(Y~.,data=don[ind!=i,], kernel="linear",probability=T)
+  # tmp <- tune(svm,Y~.,data=don[ind!=i,], kernel="linear",probability=T,ranges =
+  #        list(cost=c(0.1,1,10,100)))
+  # mod <- tmp$best.model
+  res[ind==i,"svm"] <- attr(predict(mod,newdata = don[ind==i,],probability = T),"probabilities")[,2]
+  # arbre
+  mod <- rpart(Y~., data = don[ind!=i,], method="class")
+  res[ind==i, "arbre"] <- predict(mod, don[ind==i,], type="prob")[,2]
+}
+fin <- Sys.time()
+fin-deb
+
+############################################
+# Perceptron multicouche
+############################################
+library(keras)
+
+for (i in 1:bloc){
+
+  # instanciation du model
+  pm.keras <- keras_model_sequential()
+
+  # architecture
+  pm.keras %>%
+    layer_dense(units = 2, input_shape=ncol(XXA), activation = "sigmoid") %>%
+    layer_dense(units = 1, activation = "sigmoid")
+
+  # configuration de l'apprentissage
+  pm.keras %>% compile(
+    loss="mean_squared_error",
+    optimizer="sgd",
+    metrics="mae"
+  )
+
+  # lancement de l'apprentissage
+  pm.keras %>% fit(
+    XXA <- XX[ind!=i,],
+    YYA <- YY[ind!=i,],
+    epochs=80,
+    batch_size=8
+  )
+
+  # proba prediction
+  res[ind==i,"pm"] <- pm.keras %>% predict(XX[ind==i,])
+}
+```
+
+### matrice de confusion
+```{r}
+monerreur <- function(X, Y, seuil=0.5){
+  table(cut(X, breaks = c(0,seuil,1)), Y)
+}
+
+# matrice de confusion
+monerreur(res[,2],res[,1])#log
+monerreur(res[,3],res[,1])#Ridge
+monerreur(res[,4],res[,1])#Lasso
+monerreur(res[,5],res[,1])#Elastic
+monerreur(res[,6],res[,1])#Foret
+monerreur(res[,7],res[,1])#Adabo
+monerreur(res[,8],res[,1])#Logibo
+monerreur(res[,9],res[,1])#SVM
+monerreur(res[,10],res[,1])#perceptron
+monerreur(res[,11],res[,1])#arbre
+```
+
+### nombre de mal classé
+```{r}
+monerreurb <- function(X,Y,seuil=0.5){
+  Xc <- cut(X,breaks=c(0,seuil,1),labels=c(0,1))
+  sum(as.factor(Y)!=Xc)
+}
+apply(res[,-1],2,monerreurb,Y=res[,1],seuil=0.5)
+```
+
+### AUC
+```{r, warning=F}
+library(pROC)
+auc(res[,1],res[,2])#log
+auc(res[,1],res[,3])#Ridge
+auc(res[,1],res[,4])#Lasso
+auc(res[,1],res[,5])#Elastic
+auc(res[,1],res[,6])#Foret
+auc(res[,1],res[,7])#Adabo
+auc(res[,1],res[,8])#Logibo
+auc(res[,1],res[,9])#SVM
+auc(res[,1],res[,10])#perceptron
+auc(res[,1],res[,11])#arbre
+```
+
+### courbe de ROC
+```{r}
+plot(roc(res[,1],res[,2]))
+lines(roc(res[,1],res[,3]), col="red")#log
+lines(roc(res[,1],res[,4]), col="blue")#Ridge
+lines(roc(res[,1],res[,5]), col="green")#Lasso
+lines(roc(res[,1],res[,6]), col="brown")#Elastic
+lines(roc(res[,1],res[,7]), col="yellow")#Adabo
+lines(roc(res[,1],res[,8]), col="purple")#Logibo
+lines(roc(res[,1],res[,9]), col="grey")#SVM
+lines(roc(res[,1],res[,9]), col="black")#perceptron
+lines(roc(res[,1],res[,9]), col="orange")#arbre
+```
+
+
+## Etude Obesite
+```{r}
+```{r,echo=F}
+#**********************************************************************************************
+#Ce programme utilise le dataset nhanes_16012019 avec 8339 individus et 150 variables en entree
+#Etude DIABETE pour la prsesentation du 23 janvier 2019
+#************************************************************************
+
+#permet de ne pas limiter le nombre des ecritures dans la console lors des executions
+options(max.print=1000000)
+
+#declaration des librairies
+library(data.table)
+library(mice)
+library(randomForest)
+library(glmnet)
+library(pROC)
+library(gbm)
+library(foreach)
+
+nhanes<-fread("nhanes_16012019.csv")
+nhanes[,V1:=NULL,]
+dim(nhanes)#8339x150
+
+
+#Statistiques sur le dataset nhanes 8339x150
+#------------------------------------------
+#nombre total de data:1 250 850
+nrow(nhanes)*ncol(nhanes)
+#nombre total de NA:351 779 soit
+nhanes[,sum(is.na(.SD)),]
+#poids des NA:28%
+nhanes[,sum(is.na(.SD)),]/(nrow(nhanes)*ncol(nhanes))*100
+
+
+
+#/IDEES
+#travailler sur les 18 ans et plus car cette population apporte beaucoup de NA
+#faire deux ?tudes: une avec X=alimentation+habitudes de vie+sant? et l'autre avec X=alimentation
+
+
+#--------------------------------------------------
+#ETUDE I- X=X=alimentation+habitudes de vie+sant?
+#--------------------------------------------------
+
+
+#1- On va plus loin dans la s?lection et le traitement des variables
+#-------------------------------------------------------------------
+
+#je conserve les individus qui ont un DIQ010_diq renseign?
+nhanes1<-nhanes[!(is.na(DIQ010_diq)) & !(DIQ010_diq %in% c("7","9")),,]
+dim(nhanes1)#8115x150
+
+#les jeunes de moins de 18 ans g?n?rent la moiti? du nombre total des NA alors que seulement 25 d'entre eux sont diab?tiques
+#je d?cide de les ?liminer 
+nhanes1[RIDAGEYR_demo<18,sum(is.na(.SD)),]
+nhanes1[RIDAGEYR_demo>=18,sum(is.na(.SD)),]
+nhanes1[RIDAGEYR_demo<18 & DIQ010_diq %in% c("1","3"),.N,]
+nhanes1<-nhanes1[RIDAGEYR_demo>=18,,]
+dim(nhanes1)#5264x150
+
+#j'enl?ve les 43 individus avec un r?gime low sugar car l'alimentation est modifi?e dans ce cas(DRQSDT4_dr1tot=4)
+nhanes1[DRQSDT4_dr1tot=="4",.N,]
+nhanes1<-nhanes1[is.na(DRQSDT4_dr1tot),,]
+dim(nhanes1)#5221x150
+
+#traitement de la table alq (alcool)
+apply(nhanes1[,.(ALQ120Q_alq,ALQ120U_alq,ALQ130_alq),],2,function (x) sum(is.na(x)))
+
+nhanes1[ALQ120U_alq=="1",temp:=52,]
+nhanes1[ALQ120U_alq=="2",temp:=12,]
+nhanes1[ALQ120U_alq=="3",temp:=1,]
+
+nhanes1[!(is.na(ALQ120Q_alq) | ALQ120Q_alq=="777" | ALQ120Q_alq=="999" | is.na(ALQ130_alq) | ALQ130_alq=="777" | ALQ130_alq=="999"),Var_ALQ:=ALQ120Q_alq*temp*ALQ130_alq,]
+nhanes1[,c("temp","ALQ120Q_alq","ALQ120U_alq","ALQ130_alq"):=NULL,]
+dim(nhanes1)#5221x148
+
+
+#traitement de la table demo (d?mographique)
+apply(nhanes1[,.(RIDSTATR_demo,RIAGENDR_demo,RIDAGEYR_demo,DMDEDUC3_demo,DMDEDUC2_demo,
+                 DMDMARTL_demo,DMDHHSIZ_demo, 
+                 DMDFMSIZ_demo,INDHHIN2_demo,INDFMIN2_demo,INDFMPIR_demo),],2,function (x) sum(is.na(x)))
+
+nhanes1[DMDEDUC2_demo %in% c("1","2","3"),Var_EDUCATION:="secondaire",]
+nhanes1[DMDEDUC2_demo %in% c("4","5"),Var_EDUCATION:="superieur",]
+nhanes1[is.na(DMDEDUC2_demo) | DMDEDUC2_demo %in% c("7","9"),Var_EDUCATION:=NA,]
+nhanes1[,c("DMDEDUC2_demo","DMDEDUC3_demo"):=NULL,]
+nhanes1$Var_EDUCATION<-factor(nhanes1$Var_EDUCATION)
+dim(nhanes1)#5221x147
+
+#traitement de la table bmx (body measures)
+#on a d?j? le BMI quantitatif pour toute la population avec BMXBMI; BMDBMIC ne porte que sur les jeunes
+nhanes1[,BMDBMIC_bmx:=NULL,]
+dim(nhanes1)#5221x146
+
+#traitement de la table ocq (travail ou recherche d'emploi);je regroupe les 7/9/NA vu leur faible nombre
+nhanes1[OCD150_ocq %in% c("1","2"),Var_TRAVAIL:="oui",]
+nhanes1[OCD150_ocq %in% c("3", "4","7","9") | is.na(OCD150_ocq),Var_TRAVAIL:="non",]
+nhanes1[,c("OCD150_ocq","OCQ180_ocq"):=NULL,]
+nhanes1$Var_TRAVAIL<-factor(nhanes1$Var_TRAVAIL)
+dim(nhanes1)#5221x145
+
+#traitement de la table duq (drogue)
+#seules les personnes de 18 ? 69 ans sont incluses dans le fichier
+nhanes1[DUQ200_duq=="1" | DUQ240_duq=="1" | DUQ370_duq=="1",Var_DROGUE:="oui",]
+nhanes1[DUQ200_duq=="2" & DUQ240_duq=="2" & DUQ370_duq=="2",Var_DROGUE:="non",]
+nhanes1[!(Var_DROGUE=="oui" | Var_DROGUE=="non"),Var_DROGUE:=NA,]
+nhanes1[,c("DUQ200_duq","DUQ240_duq","DUQ370_duq"):=NULL,]
+nhanes1$Var_DROGUE<-factor(nhanes1$Var_DROGUE)
+table(nhanes1$Var_DROGUE,useNA="always")
+dim(nhanes1)#5221x143
+
+#traitement de la table dpq (d?pressif)
+nhanes1[DPQ020_dpq=="0",Var_DEPRESSION:="non",]
+nhanes1[DPQ020_dpq %in% c("1","2","3"),Var_DEPRESSION:="oui",]
+nhanes1[DPQ020_dpq %in% c("7","9") | is.na(DPQ020_dpq),Var_DEPRESSION:=NA, ]
+nhanes1[,c("DPQ020_dpq"):=NULL,]
+nhanes1$Var_DEPRESSION<-factor(nhanes1$Var_DEPRESSION)
+table(nhanes1$Var_DEPRESSION,useNA="always")
+dim(nhanes1)#5221x143
+
+#traitement du statut marital de la table demo (DMDMARTL_demo)
+nhanes1[DMDMARTL_demo %in% c("1","6"),Var_SITUATION:="couple",]
+nhanes1[DMDMARTL_demo %in% c("2","3","4","5"),Var_SITUATION:="seul",]
+nhanes1[DMDMARTL_demo %in% c("77","99") | is.na(DMDMARTL_demo),Var_SITUATION:=NA,]
+nhanes1[,c("DMDMARTL_demo"):=NULL,]
+nhanes1$Var_SITUATION<-factor(nhanes1$Var_SITUATION)
+dim(nhanes1)#5221x143
+
+#traitement du sexe de la table demo
+nhanes1$RIAGENDR_demo<-as.factor(nhanes1$RIAGENDR_demo)
+
+#traitement de la table diq (DIQ160_diq); corr?l?e et mieux vaut rester sur le diab?te pur
+nhanes1[,c("DIQ160_diq"):=NULL,]
+dim(nhanes1)#5221x142
+
+
+#la table slq ne posera pas de probl?me quand on aura zoom? sur les majeurs
+nhanes1[is.na(SLQ050_slq),.N,]
+nhanes1[is.na(SLD012_slq),.N,]
+
+#traitement de la table smq
+nhanes1[SMQ040_smq %in% c("1","2"),Var_FUMEUR:="oui",]
+nhanes1[SMQ040_smq %in% c("3"),Var_FUMEUR:="non",]
+nhanes1[,c("SMQ040_smq"):=NULL,]
+nhanes1$Var_FUMEUR<-factor(nhanes1$Var_FUMEUR)
+table(nhanes1$Var_FUMEUR,useNA="always")
+dim(nhanes1)#5221x142
+
+
+#traitement de la table smqfam
+nhanes1[SMD460_smqfam=="0",Var_COFUMEUR:="non",]
+nhanes1[SMD460_smqfam %in% c("1","2","3"),Var_COFUMEUR:="oui",]
+nhanes1[,c("SMD460_smqfam"):=NULL,]
+nhanes1$Var_COFUMEUR<-factor(nhanes1$Var_COFUMEUR)
+table(nhanes1$Var_COFUMEUR,useNA="always")
+dim(nhanes1)#5221x142
+
+
+#Exploration des variables du nombre des personnes qui vivent dans la famille ou le household
+nhanes1[DMDHHSIZ_demo!=DMDFMSIZ_demo,.(DMDHHSIZ_demo,DMDFMSIZ_demo),]
+nhanes1[DMDFMSIZ_demo>DMDHHSIZ_demo,.N,]
+dim(nhanes1)#5221x142
+
+#traitement de la consommation habituelle de sel
+nhanes1[DBD100_dr1tot %in% c("7","9") | is.na(DBD100_dr1tot),DBD100_dr1tot:=NA,]
+
+#traitement des tensions art?rielles
+#nhanes1[,Var_TENSIONSY:=mean(BPXSY1_bpx,BPXSY2_bpx,BPXSY3_bpx),] ne marche pas
+nhanes1[,Var_TENSIONSY:=(BPXSY1_bpx+BPXSY2_bpx+BPXSY3_bpx)/3,]
+nhanes1[,Var_TENSIONDI:=(BPXDI1_bpx+BPXDI2_bpx+BPXDI3_bpx)/3,]
+nhanes1[,c("BPXSY1_bpx","BPXSY2_bpx","BPXSY3_bpx","BPXSY4_bpx","BPXDI1_bpx","BPXDI2_bpx","BPXDI3_bpx","BPXDI4_bpx"):=NULL,]
+dim(nhanes1)#5221x136
+
+#traitement de l'argent destin? ? la consommation
+nhanes1[,Var_ARGENTALIM:=(CBD071_cbq+CBD111_cbq+CBD121_cbq+CBD131_cbq),]
+nhanes1[,c("CBD071_cbq","CBD111_cbq","CBD121_cbq","CBD131_cbq","CBD091_cbq"):=NULL,]
+nhanes1[is.na(Var_ARGENTALIM),.N,]
+dim(nhanes1)#5221x132
+
+#traitement de la table OHXREF
+nhanes1[OHAREC_ohxref=="1",Var_DENTISTE:="Imm?diatement",]
+nhanes1[OHAREC_ohxref=="2",Var_DENTISTE:="Visite sous 2 semaines",]
+nhanes1[OHAREC_ohxref=="3",Var_DENTISTE:="Visite sous convenance",]
+nhanes1[OHAREC_ohxref=="4",Var_DENTISTE:="Pas de visite prochaine",]
+nhanes1[,c("OHAREC_ohxref"):=NULL,]
+nhanes1$Var_DENTISTE<-as.factor(nhanes1$Var_DENTISTE)
+dim(nhanes1)#5221x132
+
+#traitement de l'assurance
+nhanes1[HIQ011_hiq=="1",Var_ASSURE:="oui",]
+nhanes1[HIQ011_hiq=="2",Var_ASSURE:="non",]
+nhanes1[HIQ011_hiq %in% c("7","9"),Var_ASSURE:=NA,]
+nhanes1[,c("HIQ011_hiq"):=NULL,]
+nhanes1$Var_ASSURE<-as.factor(nhanes1$Var_ASSURE)
+dim(nhanes1)#5221x132
+
+#traitement de statut de propriete ou location
+nhanes1[HOQ065_hoq=="1",Var_MAISON:="proprietaire",]
+nhanes1[HOQ065_hoq=="2",Var_MAISON:="en location",]
+nhanes1[HOQ065_hoq %in% c("7","9"),Var_MAISON:=NA,]
+nhanes1[,c("HOQ065_hoq"):=NULL,]
+nhanes1$Var_MAISON<-as.factor(nhanes1$Var_MAISON)
+dim(nhanes1)#5221x132
+
+#traitement de la table hoq
+nhanes1[HOD050_hoq %in% c("777","999"),HOD050_hoq:=NA,]
+
+#mise en facteurs des variables ad hoc
+nhanes1[BPQ020_bpq %in% c("7","9"),BPQ020_bpq:=NA,]
+nhanes1[BPQ080_bpq %in% c("7","9"),BPQ080_bpq:=NA,]
+nhanes1[MCQ080_mcq %in% c("7","9"),MCQ080_mcq:=NA,]
+nhanes1[MCQ160A_mcq %in% c("7","9"),MCQ160A_mcq:=NA,]
+nhanes1[MCQ160B_mcq %in% c("7","9"),MCQ160B_mcq:=NA,]
+nhanes1[MCQ160C_mcq %in% c("7","9"),MCQ160C_mcq:=NA,]
+nhanes1[MCQ160D_mcq %in% c("7","9"),MCQ160D_mcq:=NA,]
+nhanes1[MCQ160E_mcq %in% c("7","9"),MCQ160E_mcq:=NA,]
+nhanes1[MCQ160F_mcq %in% c("7","9"),MCQ160F_mcq:=NA,]
+nhanes1[MCQ160G_mcq %in% c("7","9"),MCQ160G_mcq:=NA,]
+nhanes1[MCQ160M_mcq %in% c("7","9"),MCQ160M_mcq:=NA,]
+nhanes1[MCQ160N_mcq %in% c("7","9"),MCQ160N_mcq:=NA,]
+nhanes1[MCQ160A_mcq %in% c("7","9"),MCQ160A_mcq:=NA,]
+nhanes1[SLQ050_slq %in% c("7","9"),SLQ050_slq:=NA,]
+nhanes1[PAQ605_paq %in% c("7","9"),PAQ605_paq:=NA,]
+nhanes1[PAQ620_paq %in% c("7","9"),PAQ620_paq:=NA,]
+nhanes1[PAQ635_paq %in% c("7","9"),PAQ635_paq:=NA,]
+nhanes1[PAQ650_paq %in% c("7","9"),PAQ650_paq:=NA,]
+nhanes1[PAQ665_paq %in% c("7","9"),PAQ665_paq:=NA,]
+nhanes1[HEQ010_heq %in% c("7","9"),HEQ010_heq:=NA,]
+nhanes1[HEQ030_heq %in% c("7","9"),HEQ030_heq:=NA,]
+
+nhanes1$BPQ020_bpq<-as.factor(nhanes1$BPQ020_bpq)
+nhanes1$BPQ080_bpq<-as.factor(nhanes1$BPQ080_bpq)
+nhanes1$MCQ080_mcq<-as.factor(nhanes1$MCQ080_mcq)
+nhanes1$MCQ160A_mcq<-as.factor(nhanes1$MCQ160A_mcq)
+nhanes1$MCQ160B_mcq<-as.factor(nhanes1$MCQ160B_mcq)
+nhanes1$MCQ160C_mcq<-as.factor(nhanes1$MCQ160C_mcq)
+nhanes1$MCQ160D_mcq<-as.factor(nhanes1$MCQ160D_mcq)
+nhanes1$MCQ160E_mcq<-as.factor(nhanes1$MCQ160E_mcq)
+nhanes1$MCQ160F_mcq<-as.factor(nhanes1$MCQ160F_mcq)
+nhanes1$MCQ160G_mcq<-as.factor(nhanes1$MCQ160G_mcq)
+nhanes1$MCQ160M_mcq<-as.factor(nhanes1$MCQ160M_mcq)
+nhanes1$MCQ160N_mcq<-as.factor(nhanes1$MCQ160N_mcq)
+nhanes1$SLQ050_slq<-as.factor(nhanes1$SLQ050_slq)
+nhanes1$PAQ605_paq<-as.factor(nhanes1$PAQ605_paq)
+nhanes1$PAQ620_paq<-as.factor(nhanes1$PAQ620_paq)
+nhanes1$PAQ635_paq<-as.factor(nhanes1$PAQ635_paq)
+nhanes1$PAQ650_paq<-as.factor(nhanes1$PAQ650_paq)
+nhanes1$PAQ665_paq<-as.factor(nhanes1$PAQ665_paq)
+nhanes1$HEQ010_heq<-as.factor(nhanes1$HEQ010_heq)
+nhanes1$HEQ030_heq<-as.factor(nhanes1$HEQ030_heq)
+
+#traitement de suppression de variables
+#--------------------------------------
+
+#les 16 variables DR1TOT qui sont mal renseign?es ou ne nous apportent rien pour l'?tude diab?te
+#les 2  variables de prise de tension n?4 BPXSY4 et BPXDI4 tr?s mal renseign?es (8042NA) (on se basera sur 3 prises de tensions)
+#les 3 variable ecq ne concernent que les enfants de 0 ? 15 ans donc on ne pourra pas traiter un mod?le g?n?ral (adultes+enfants)
+#DMDHHSIZ_demo est toujours sup?rieur ou ?gal ? DMDFMSIZ_demo donc je garde  DMDHHSIZ_demo
+#pour les revenus je garde les revenus du household INDHHIN2_demo par coh?rence; data aussi bien renseign?e que la famille
+
+dput(names(nhanes1))
+length(dput(names(nhanes1)))
+nhanes1<-nhanes1[,c("SEQN",
+                    # "RIDSTATR_demo",
+                    "RIAGENDR_demo", "RIDAGEYR_demo", "DMDHHSIZ_demo",
+                    # "DMDFMSIZ_demo",
+                    "INDHHIN2_demo",
+                    # "INDFMIN2_demo",
+                    "INDFMPIR_demo","BMXWT_bmx", "BMXHT_bmx", "BMXBMI_bmx",
+                    "BPQ020_bpq", "BPQ080_bpq",
+                    "DIQ010_diq",
+                    # "ECD010_ecq", "ECQ020_ecq", "ECD070B_ecq",
+                    "HEQ010_heq", "HEQ030_heq",
+                    # "HIQ011_hiq",
+                    "HOD050_hoq",
+                    # "HOQ065_hoq",
+                    # "IMQ011_imq", "IMQ020_imq", "MCQ010_mcq", 
+  "MCQ080_mcq", "MCQ160A_mcq", "MCQ160N_mcq", "MCQ160B_mcq", "MCQ160C_mcq", 
+  "MCQ160D_mcq", "MCQ160E_mcq", "MCQ160F_mcq", "MCQ160G_mcq", "MCQ160M_mcq", 
+  # "MCQ160K_mcq", "MCQ160L_mcq", "MCQ220_mcq",
+  # "MCQ230A_mcq", "MCQ230B_mcq", "MCQ230C_mcq", "MCQ230D_mcq",
+  # "OHAREC_ohxref",
+  "PAQ605_paq", "PAQ620_paq", "PAQ635_paq", "PAQ650_paq", "PAQ665_paq", "PAD680_paq", 
+  "SLD012_slq", "SLQ050_slq",
+  # "SMD030_smq", "SMQ720_smqrtu",
+  "LBXBPB_pbcd", "LBDBPBSI_pbcd", "LBDBPBLC_pbcd",
+  "DR1TKCAL_dr1tot", 
+  "DR1TPROT_dr1tot", "DR1TCARB_dr1tot", "DR1TSUGR_dr1tot", "DR1TFIBE_dr1tot", 
+  "DR1TTFAT_dr1tot", "DR1TSFAT_dr1tot", "DR1TMFAT_dr1tot", "DR1TPFAT_dr1tot", 
+  "DR1TCHOL_dr1tot", "DR1TATOC_dr1tot", "DR1TATOA_dr1tot", "DR1TRET_dr1tot", 
+  "DR1TVARA_dr1tot", "DR1TACAR_dr1tot", "DR1TBCAR_dr1tot", "DR1TCRYP_dr1tot", 
+  "DR1TLYCO_dr1tot", "DR1TLZ_dr1tot", "DR1TVB1_dr1tot", "DR1TVB2_dr1tot", 
+  "DR1TNIAC_dr1tot", "DR1TVB6_dr1tot", "DR1TFOLA_dr1tot", "DR1TFA_dr1tot", 
+  "DR1TFF_dr1tot", "DR1TFDFE_dr1tot", "DR1TCHL_dr1tot", "DR1TVB12_dr1tot", 
+  "DR1TB12A_dr1tot", "DR1TVC_dr1tot", "DR1TVD_dr1tot", "DR1TVK_dr1tot", 
+  "DR1TCALC_dr1tot", "DR1TPHOS_dr1tot", "DR1TMAGN_dr1tot", "DR1TIRON_dr1tot", 
+  "DR1TZINC_dr1tot", "DR1TCOPP_dr1tot", "DR1TSODI_dr1tot", "DR1TPOTA_dr1tot", 
+  "DR1TSELE_dr1tot", "DR1TCAFF_dr1tot", "DR1TTHEO_dr1tot", "DR1TALCO_dr1tot", 
+  "DR1TMOIS_dr1tot", "DR1.320Z_dr1tot",
+  # "DRABF_dr1tot","DRDINT_dr1tot", 
+  "DBD100_dr1tot",
+  # "DRQSDIET_dr1tot", "DRQSDT1_dr1tot", "DRQSDT2_dr1tot", 
+  # "DRQSDT3_dr1tot", "DRQSDT4_dr1tot", "DRQSDT5_dr1tot", "DRQSDT6_dr1tot", 
+  # "DRQSDT7_dr1tot", "DRQSDT8_dr1tot", "DRQSDT9_dr1tot", "DRQSDT10_dr1tot", 
+  # "DRQSDT11_dr1tot", "DRQSDT12_dr1tot", "DRQSDT91_dr1tot",
+  "Var_ALQ", 
+  "Var_EDUCATION", "Var_TRAVAIL", "Var_DROGUE", "Var_DEPRESSION", 
+  "Var_SITUATION", "Var_FUMEUR", "Var_COFUMEUR", "Var_TENSIONSY", 
+  "Var_TENSIONDI", "Var_ARGENTALIM","Var_DENTISTE","Var_ASSURE")]
+
+
+dim(nhanes1)#5221x97
+
+str(nhanes1)
+
+
+dt<-data.table(var=names(nhanes1),nbna=apply(nhanes1,2,function (x) {sum(is.na(x))}))
+dt
+
+
+nhanes1<-data.frame(nhanes1)
+
+
+
+#je ne garde que les variables qui ont moins de 10% de NA et performe le mice dessus
+#-----------------------------------------------------------------------------------
+
+dt<-data.table(var=names(nhanes1),nbna=apply(nhanes1,2,function (x) {sum(is.na(x))}))
+dt
+var_ok<-dt[,nbna<=0.1*nrow(nhanes1)]
+var_ok
+nhanes1<-nhanes1[,var_ok]
+dim(nhanes1)#nhanes3 comporte maintenant 5221 individus et 90 variables
+
+
+
+
+#2- Imputation par mice
+#----------------------
+
+
+imp<-mice(nhanes1,m=1)
+nhanes2<-complete(imp)
+dim(nhanes2)#5221x90
+str(nhanes1)
+dt<-data.table(var=names(nhanes2),nbna=apply(nhanes2,2,function (x) {sum(is.na(x))}))
+dt[,sum(is.na(.SD)),]
+
+
+
+
+#3- Mod?les
+#----------
+
+
+nhanes3<-nhanes2
+nhanes3[,1]<-NULL
+dim(nhanes3)#5221x89
+str(nhanes3)
+nhanes3$RIAGENDR_demo<-factor(nhanes3$RIAGENDR_demo)
+
+
+#il faut passer le Y en num?rique 0/1 pour le glm 
+nhanes3[nhanes3$DIQ010_diq =="2",11]<-c("0")
+nhanes3[nhanes3$DIQ010_diq %in% c("1","3"),11]<-c("1")
+#
+
+
+#le Y est un chr il faut le passer en num?rique
+nhanes3$DIQ010_diq <- as.numeric(nhanes3$DIQ010_diq)
+
+#Regression logistique avec les 89 variables
+#-------------------------------------------
+reglog<-glm(DIQ010_diq~.,data=nhanes3,family="binomial")
+summary(reglog)
+
+
+#Regression logistique amelioree avec le step
+#--------------------------------------------
+null=glm(DIQ010_diq~1, data=nhanes3,family=binomial)
+null
+full=glm(DIQ010_diq~., data=nhanes3,family=binomial)
+full
+
+bestmodel=step(null, scope=list(lower=null, upper=full), direction="forward")
+summary(bestmodel)
+
+#------
+
+#
+bloc<-4
+set.seed(1234)
+ind <- sample(1:nrow(nhanes3)%%bloc+1)
+RES<- data.frame(Y=nhanes3$DIQ010_diq,log=0,foret=0,ridge=0,
+                 lasso=0,elastic=0,adaboost=0,logiboost=0,svm=0)
+
+nhanes4<-nhanes3
+nhanes4$DIQ010_diq<-factor(nhanes4$DIQ010_diq)
+
+#XX <- as.matrix(nhanes3[,-ncol(nhanes3)])
+XX<-model.matrix(nhanes3$DIQ010_diq~.,data=nhanes3)
+
+LAridge=list()
+
+foreach (i = 1:bloc, .packages = c("gbm","glmnet","randomForest", "rpart")) %dopar% {
+  XXA <- XX[ind!=i,]
+  YYA <- as.matrix(nhanes3[ind!=i,"DIQ010_diq"])
+  # 
+  #logistique
+  #mod <- glm(DIQ010_diq~.,data=nhanes3[ind!=i,],family="binomial")
+  RES[ind==i,"log"] <- predict(bestmodel,nhanes3[ind==i,],type="response")
+  #for?t
+  mod <- randomForest(DIQ010_diq~.,data=nhanes4[ind!=i,])
+  RES[ind==i,"foret"] <- predict(mod,nhanes4[ind==i,],type="prob")[,2]
+  #ridge
+  tmp <- cv.glmnet(XXA,YYA,alpha=0,family="binomial")
+  LAridge <- c(LAridge,tmp$lambda.min)
+  mod <- glmnet(XXA,YYA,alpha=0,lambda=tmp$lambda.min,family="binomial")
+  RES[ind==i,"ridge"] <- predict(mod,newx=XX[ind==i,],type="response")
+  #lasso
+  mod <- cv.glmnet(XXA,YYA,alpha=1)
+  RES[ind==i,"lasso"] <- predict(mod,newx=XX[ind==i,],lambda=mod$lambda.min)
+  # #elastic
+  mod <- cv.glmnet(XXA,YYA,alpha=0.5)
+  mod <- glmnet(XXA,YYA,alpha=.5,lambda=tmp$lambda.min)
+  RES[ind==i,"elastic"] <- predict(mod,newx=XX[ind==i,])
+  # #adaboost
+  tmp <- gbm(DIQ010_diq~.,data = nhanes3[ind!=i,], distribution = "adaboost", interaction.depth = 2,
+            shrinkage = 0.1,n.trees = 500)
+  M <- gbm.perf(tmp)[1]
+  mod <- gbm(DIQ010_diq~.,data = nhanes3[ind!=i,], distribution = "adaboost", interaction.depth = 2,
+            shrinkage = 0.1,n.trees = M)
+  RES[ind==i, "adaboost"] <- predict(mod, newdata=nhanes3[ind==i,], type = "response", n.trees = M)
+  #logiboost
+  tmp <- gbm(DIQ010_diq~.,data=nhanes3[ind!=i,], distribution="bernoulli", interaction.depth = 2,
+           shrinkage=0.1,n.trees=500)
+  M <- gbm.perf(tmp)[1]
+  mod <- gbm(DIQ010_diq~.,data=nhanes3[ind!=i,], distribution="bernoulli", interaction.depth = 2,
+           shrinkage=0.1,n.trees=M)
+  RES[ind==i, "logiboost"] <- predict(mod,newdata=nhanes3[ind==i,], type= "response", n.trees = M)
+  }
+
+monerreur <- function(X,Y,seuil){
+  t<-table(cut(X,breaks=c(0,seuil,1)),as.factor(Y))
+  df<-data.frame(table(cut(X,breaks=c(0,seuil,1)),as.factor(Y)))
+  taux_mal_classes<-(df[2,3]+df[3,3])/sum(df$Freq)*100
+  liste<-list(t,taux_mal_classes)
+  return(liste)
+  }
+
+
+nhanes3<-data.table(nhanes3)
+nhanes3[,.N,]
+nhanes3[DIQ010_diq=="0",.N,]
+nhanes3[DIQ010_diq=="1",.N,]
+taux_positifs<-nhanes3[DIQ010_diq=="1",.N,]/nhanes3[,.N,]*100
+taux_positifs
+taux_negatifs<-nhanes3[DIQ010_diq=="0",.N,]/nhanes3[,.N,]*100
+taux_negatifs
+#si tout le monde est class? en n?gatif alors on commet une erreur de 4376/5221=16,2%
+#si tout le monde est class? en positif alors on commet une erreur de 4376/5221=83,8%
+#la logistique am?liore un petit peu le mod?le trivial avec un taux de mal class?s de 14,55 pour le seuil de 0.5
+
+taux_synthese<-data.frame()
+for (i in 2:8) {
+  taux_synthese[1,i-1]<-taux_negatifs
+  taux_synthese[11,i-1]<-taux_positifs
+  k<-2
+  for (j in seq(0.1,0.9,0.1)) {
+    taux_synthese[k,i-1]<-monerreur(RES[,i],RES[,1],j)[[2]]
+    k<-k+1
+  }  }
+colnames(taux_synthese)<-c("logistique","foret","ridge","lasso","elasticnet","adaboost","logiboost")
+rownames(taux_synthese)<-seq(0,1,0.1)
+taux_synthese
+
+```
+
+```{r}
+#Graphique des taux de mal class?s
+#---------------------------------
+plot(seq(0,1,0.1),taux_synthese$logistique)
+lines(seq(0,1,0.1),taux_synthese$logistique,lty=3,lwd=5)
+lines(seq(0,1,0.1),taux_synthese$foret,col="green",lwd=2)
+lines(seq(0,1,0.1),taux_synthese$ridge,col="red",lwd=2)
+lines(seq(0,1,0.1),taux_synthese$lasso,col="blue",lwd=2)
+lines(seq(0,1,0.1),taux_synthese$elasticnet,col="orange",lwd=2)
+lines(seq(0,1,0.1),taux_synthese$adaboost,col="brown",lwd=2)
+lines(seq(0,1,0.1),taux_synthese$logiboost,col="purple",lwd=2)
+
+legend(0.7, 60, legend=c("log","for?t","ridge","lasso","elastic","adaboost","logiboost"),
+       col=c("black", "green","red","blue","orange","brown","purple"),lwd=2, cex=1)
+
+
+
+#courbes ROC
+#-----------
+roclog <- roc(RES[,1],RES[,2])
+plot(roclog)
+rocfor <- roc(RES[,1],RES[,3])
+lines(rocfor,col="green")
+rocrid<-roc(RES[,1],RES[,4])
+lines(rocrid,col="red")
+roclas<-roc(RES[,1],RES[,5])
+lines(roclas,col="blue")
+rocela<-roc(RES[,1],RES[,6])
+lines(rocela,col="grey")
+rocada<-roc(RES[,1],RES[,7])
+lines(rocada,col="brown")
+roclogib<-roc(RES[,1],RES[,8])
+lines(roclogib,col="purple")
+
+
+
+legend(0.2, 0.4, legend=c("log","for?t","ridge","lasso","elastic","adaboost","logiboost"),
+       col=c("black", "green","red","blue","orange","brown","purple"),lty=1,lwd=1, cex=1)
+
+
+#aires sous la courbe
+#--------------------
+auc(RES[,1],RES[,2])
+auc(RES[,1],RES[,3])
+auc(RES[,1],RES[,4])
+auc(RES[,1],RES[,5])
+auc(RES[,1],RES[,6])
+auc(RES[,1],RES[,7])
+auc(RES[,1],RES[,8])
+
+
+```
+
+```{r}
+
+####################################################################################################################################
+## NHANES 2015-2016 Questionnaire Data : BPQ_I
+## BPQ080 - Doctor told you - high cholesterol level
+##
+##  {Have you/Has SP} ever been told by a doctor or other health professional that {your/his/her} blood cholesterol level was high?
+##  Target: Both males and females 16 YEARS - 150 YEARS
+##  1 = YES, 0 = NO, 7 refused, 9 don't know, NA 0
+####################################################################################################################################
+
+library(data.table)
+
+##############################################################################################################################
+##
+## CREATION JEUX DE DONNEES POUR PREDIRE LE CHOLESTEROL
+##
+##############################################################################################################################
+
+##########################################################################################
+## ON PART de nhanes_29122018.csv (Jdd d'entr?e travaill? par JV)
+##########################################################################################
+
+nhanes <- read.csv("nhanes_16012019.csv", sep = ",") # version 29122018 + 3 variables plomb dans le sang
+#nhanes <- read.csv("nhanes_29122018.csv", sep = ",") 
+class(nhanes)
+dim(nhanes)#8339 indiv et 147 variables (+1 X)
+colnames(nhanes)
+summary(nhanes)
+summary(nhanes$BPQ080_bpq) #mon Y cholesterol est d??j?? disponible : 2758 NA
+
+
+# renommer les 2 variables (oubli?es par JV) avec _dr1tot pour faciliter la transco ? posteriori : DR1TFIBE et DR1TATOC
+names(nhanes)[89] <- "DR1TFIBE_dr1tot"
+names(nhanes)[95] <- "DR1TATOC_dr1tot"
+
+#########################################################################################
+## CRITERE N?1 : garder les individus SEQN avec mon Y Cholesterol sans NA
+#########################################################################################
+
+# Creer le vecteur des individus qui n'ont pas repondu ?? la question d'cholesterol
+ind_a_enlever <- which(is.na(nhanes$BPQ080_bpq))
+
+# enlever ces individus de la table nhanes
+nhanes <- nhanes[-ind_a_enlever,]
+dim(nhanes)#5581x148
+
+######################################################################################################
+## DIFFERENTS CRITERES METIERS : pour la r?duction des variables et la cr?ation de nouvelles variables
+######################################################################################################
+
+# analyse du crit?re Age : bcp des NA pour les jeunes ?
+min(nhanes$RIDAGEYR_demo) #L'age commence ? 16 ans pq notre Y BPQ080 est collect?e pour les indiv entre 16 et 150 ans
+temp <- subset(nhanes, RIDAGEYR_demo %in% c(16,17) )
+apply(temp,2,function (x) {sum(is.na(x))}) #somme des NA par variable
+sum(is.na(subset(nhanes, RIDAGEYR_demo %in% c(16,17) ))) #somme totale des NA
+options(max.print=1000000) #pour afficher les NA dans le suivant summary
+summary(temp)
+# Et en plus, les NA entre 16 et 17 ans ne sont pas ?normes => conclusion : pas de filtre selon l'age (idem pour BPQ020) ? diff?rence de diab?tes
+
+# conversion en data.table pour pouvoir int??grer le code de cr?ation et r?duction de variables de JV
+nhanes <- as.data.table(nhanes)
+
+# reduction du nombre de level de la variable education
+nhanes[DMDEDUC2_demo %in% c("1","2","3"),Var_EDUCATION:="secondaire",]
+nhanes[DMDEDUC2_demo %in% c("4","5"),Var_EDUCATION:="superieur",]
+nhanes[is.na(DMDEDUC2_demo) | DMDEDUC2_demo %in% c("7","9"),Var_EDUCATION:=NA,]
+nhanes[,c("DMDEDUC2_demo"):=NULL,]
+dim(nhanes)#5581x148 (1 variable remplac?e par une nouvelle variable)
+
+# reduction du nombre de level de la variable emploi
+nhanes[OCD150_ocq %in% c("1","2"),Var_TRAVAIL:="oui",]
+nhanes[OCD150_ocq %in% c("3", "4","7","9") | is.na(OCD150_ocq),Var_TRAVAIL:="non",]
+nhanes[,c("OCD150_ocq"):=NULL,]
+dim(nhanes)#5581x148
+
+# reduction du nombre de variable li??e ?? la drogue
+nhanes[DUQ200_duq=="1" | DUQ240_duq=="1" | DUQ370_duq=="1",Var_DROGUE:="oui",]
+nhanes[!(DUQ200_duq=="1" | DUQ240_duq=="1" | DUQ370_duq=="1"),Var_DROGUE:="non",]
+nhanes[,c("DUQ200_duq","DUQ240_duq","DUQ370_duq"):=NULL,]
+dim(nhanes)#5581x146 (3 variables remplac?es par une nouvelle variable)
+
+# reduction du nombre de level de la variable depression
+nhanes[DPQ020_dpq=="0",Var_DEPRESSION:="non",]
+nhanes[DPQ020_dpq %in% c("1","2","3"),Var_DEPRESSION:="oui",]
+nhanes[DPQ020_dpq %in% c("7","9") | is.na(DPQ020_dpq),Var_DEPRESSION:=NA, ]
+nhanes[,c("DPQ020_dpq"):=NULL,]
+dim(nhanes)#5581x146
+
+# reduction du nombre de level de la variable status marital
+nhanes[DMDMARTL_demo %in% c("1","6"),Var_SITUATION:="couple",]
+nhanes[DMDMARTL_demo %in% c("2","3","4","5"),Var_SITUATION:="seul",]
+nhanes[DMDMARTL_demo %in% c("77","99") | is.na(DMDMARTL_demo),Var_SITUATION:=NA,]
+nhanes[,c("DMDMARTL_demo"):=NULL,]
+dim(nhanes)#5581x146
+
+# traitement de la table alq (alcool)
+apply(nhanes[,.(ALQ120Q_alq,ALQ120U_alq,ALQ130_alq),],2,function (x) sum(is.na(x)))
+
+nhanes[ALQ120U_alq=="1",temp:=52,] #semaines dans l'ann?e
+nhanes[ALQ120U_alq=="2",temp:=12,] #mois dans l'ann?e
+nhanes[ALQ120U_alq=="3",temp:=1,]
+
+nhanes[!(is.na(ALQ120Q_alq) | ALQ120Q_alq=="777" | ALQ120Q_alq=="999" | is.na(ALQ130_alq) | ALQ130_alq=="777" | ALQ130_alq=="999"),Var_ALQ:=ALQ120Q_alq*temp*ALQ130_alq,]
+nhanes[,c("temp","ALQ120Q_alq","ALQ120U_alq","ALQ130_alq"):=NULL,]
+dim(nhanes)#5581x144
+# REFAIRE avec le code DPLYR d'Insaf !
+
+# analyse de la mesure du Cholesterol : DR1TCHOL
+summary(nhanes$DR1TCHOL_dr1tot) #BONNE NOUVELLE : 0 NA!!
+
+# j'enl?ve les individus avec un r?gime low Cholesterol car l'alimentation est modifi?e dans ce cas(DRQSDT2_dr1tot=2)
+summary(nhanes$DRQSDT2_dr1tot)  #5470 NA => pas grande chose ? supprimer sur les 5581 individus
+nhanes[DRQSDT2_dr1tot=="2",.N,] #111 indiv avec cette di?te!! 
+nhanes<-nhanes[is.na(DRQSDT2_dr1tot),,]
+dim(nhanes)#5470x144
+
+# traitement de la table smq
+nhanes[SMQ040_smq %in% c("1","2"),Var_FUMEUR:="oui",]
+nhanes[SMQ040_smq %in% c("3"),Var_FUMEUR:="non",]
+nhanes[,c("SMQ040_smq"):=NULL,]
+nhanes$Var_FUMEUR<-factor(nhanes$Var_FUMEUR)
+table(nhanes$Var_FUMEUR,useNA="always")
+dim(nhanes)#5470x144
+
+# traitement de la table smqfam
+nhanes[SMD460_smqfam=="0",Var_COFUMEUR:="non",]
+nhanes[SMD460_smqfam %in% c("1","2","3"),Var_COFUMEUR:="oui",]
+nhanes[,c("SMD460_smqfam"):=NULL,]
+nhanes$Var_COFUMEUR<-factor(nhanes$Var_COFUMEUR)
+table(nhanes$Var_COFUMEUR,useNA="always")
+dim(nhanes)#5470x144
+
+# exploration des variables du nombre des personnes qui vivent dans la famille ou le household
+nhanes[DMDHHSIZ_demo!=DMDFMSIZ_demo,.(DMDHHSIZ_demo,DMDFMSIZ_demo),]
+nhanes[DMDFMSIZ_demo>DMDHHSIZ_demo,.N,]
+dim(nhanes)#5470x144
+
+#traitement de l'argent destin? ? la consommation
+nhanes[,Var_ARGENTALIM:=(CBD071_cbq+CBD111_cbq+CBD121_cbq+CBD131_cbq),]
+nhanes[,c("CBD071_cbq","CBD111_cbq","CBD121_cbq","CBD131_cbq","CBD091_cbq"):=NULL,]
+nhanes[is.na(Var_ARGENTALIM),.N,]
+dim(nhanes)#5470x140
+
+# traitement des tensions art?rielles : pas appliqu?, je garde les 3 variables BPXSY1_bpx+BPXSY2_bpx+BPXSY3_bpx
+# traitement de suppression manuelle de variables : pas appliqu?, on attend voir les supressions du 10% NA
+
+##################################################################################################
+## DERNIER CRITERE : la suppression des variables X avec un nbr de NA sup?rieur ? 10 %
+##################################################################################################
+
+nhanes <- as.data.frame(nhanes)
+
+########
+# Choix 2
+########
+
+# reperer les variable qui ne depassent pas les 10% de NA's (Yfan l'a appliqu? pour 5%)
+# var_na_acceptable <- labels(which(apply(nhanes,2,function (x) sum(is.na(x)))<=floor(dim(nhanes)[1]/10))) 
+# which(apply(nhanes,2,function (x) sum(is.na(x)))<=floor(dim(nhanes)[1]/10)) #93 variables
+
+# un petit topo des variables que finalement nous allons supprimer
+# var_na_pasacceptable <- labels(which(apply(nhanes,2,function (x) sum(is.na(x)))>floor(dim(nhanes)[1]/10))) 
+# which(apply(nhanes,2,function (x) sum(is.na(x)))>floor(dim(nhanes)[1]/10))  #47 variables
+# si on applique 5% seulement INDFMPIR_demo (variable seuil de pauvret? de la famille) est supprim?e en plus
+
+# Choix 2 : VARIABLES SUPPRIMEES :
+
+#  DMDEDUC3_demo   INDFMPIR_demo     
+# => education before 19ans et poverty
+
+#  BMDBMIC_bmx      BPXSY4_bpx      BPXDI4_bpx      
+#  DIQ160_diq      ECD010_ecq      ECQ020_ecq 
+#  ECD070B_ecq     MCQ160A_mcq     MCQ160N_mcq     MCQ160B_mcq     MCQ160C_mcq     MCQ160D_mcq     MCQ160E_mcq     MCQ160F_mcq 
+#  MCQ160G_mcq     MCQ160M_mcq     MCQ160K_mcq     MCQ160L_mcq      MCQ220_mcq     MCQ230A_mcq     MCQ230B_mcq     MCQ230C_mcq 
+#  MCQ230D_mcq      OCQ180_ocq      SMD030_smq   SMQ720_smqrtu   
+# => pressure, body, medical conditions and smoking
+
+#  DBD100_dr1tot  DRQSDT1_dr1tot  DRQSDT2_dr1tot  DRQSDT3_dr1tot DRQSDT4_dr1tot  DRQSDT5_dr1tot  DRQSDT6_dr1tot  
+#  DRQSDT7_dr1tot  DRQSDT8_dr1tot  DRQSDT9_dr1tot DRQSDT10_dr1tot DRQSDT11_dr1tot DRQSDT12_dr1tot DRQSDT91_dr1tot   
+# =>  sel et di?tes
+
+#  Var_EDUCATION      Var_DROGUE  Var_DEPRESSION   Var_SITUATION         Var_ALQ      Var_FUMEUR 
+# => ... Alcool
+
+# Choix 3 : un petit test de pourquoi les variables plomb dans le sang vont ?tre supprim?es
+# summary(nhanes$LBXBPB)
+# summary(nhanes$LBDBPBSI)
+# summary(nhanes$LBDBPBLC) #2864NA pour les 3var
+
+# netoyage de nhanes pour ne garder que les variables moins de 10% de NA's
+# dim(nhanes) #5470x140
+# nhanes <- nhanes[,var_na_acceptable]
+# dim(nhanes) #5470x93
+
+# colnames(nhanes)
+# UN PETIT TOPO DES VARIABLES D'INTERET POUR CHOLESTEROL
+# Mesure du nutriment Sucre variable disponible dans le Jdd
+# DR1TSUGR
+# Mesure des Graisses variables disponibles dans le Jdd
+# DR1TTFAT
+# DR1TSFAT
+# DR1TMFAT
+# DR1TPFAT
+# Mesure du Cholesterol variable disponible dans le Jdd
+# DR1TCHOL
+# D'autres maladies
+# "DIQ010_diq"=> diab?tes
+# "HEQ010_heq" => hepatitis B
+# "HEQ030_heq" => hepatitis C
+# "BPQ020_bpq" => hypertension
+# "SLQ050_slq" => trouble sommeil
+# Individus sans Di?te Cholesterol variable supprim?e dans le Jdd
+# DRQSDT2
+# SURPOIDS
+# MCQ080
+# Mesure du Plomb dans le sang variables supprim?es dans le Jdd initial de 147var (table PBCD) : ajout? dans 150var mais supprim? ? la fin du Jdd Choix 3
+# LBXBPB
+# LBXBPBSI
+# LBXBPBLC
+
+
+################
+# Choix 3
+################
+
+dim(nhanes)#5581x143 (140+3var)
+
+# Creer le vecteur des individus 
+ind_a_enlever <- which(is.na(nhanes$LBXBPB_pbcd))
+
+# enlever ces individus de la table nhanes
+nhanes <- nhanes[-ind_a_enlever,]
+dim(nhanes)#2606x143
+
+summary(nhanes$LBXBPB)
+summary(nhanes$LBDBPBSI)
+summary(nhanes$LBDBPBLC) #0NA pour les 3var
+
+# reperer les variable qui ne depassent pas les 10% de NA's 
+var_na_acceptable <- labels(which(apply(nhanes,2,function (x) sum(is.na(x)))<=floor(dim(nhanes)[1]/10))) 
+which(apply(nhanes,2,function (x) sum(is.na(x)))<=floor(dim(nhanes)[1]/10)) 
+
+# un petit topo des variables que finalement nous allons supprimer
+var_na_pasacceptable <- labels(which(apply(nhanes,2,function (x) sum(is.na(x)))>floor(dim(nhanes)[1]/10))) 
+which(apply(nhanes,2,function (x) sum(is.na(x)))>floor(dim(nhanes)[1]/10))  
+
+
+# netoyage de nhanes pour ne garder que les variables moins de 10% de NA's
+dim(nhanes) #2606x143
+nhanes <- nhanes[,var_na_acceptable]
+dim(nhanes) #2606x110
+
+colnames(nhanes)
+
+###################################################################################################
+## PRODUIRE LE JDD FINAL qu'on utilisera pour chercher le meilleur mod?le de pr?diction 
+###################################################################################################
+
+# enlever la champs "X" qui ne sert ?? rien
+nhanes$X <- NULL
+
+# renommer la variable d'etude en y -> cholesterol = BPQ080
+colnames(nhanes)[grep("BPQ080*",colnames(nhanes))] <- "y"
+
+# deplacer le y en dernier
+nhanes <- cbind(subset(nhanes,select=-y),nhanes$y)
+
+# le fichier de sortie 
+#write.csv(nhanes,"JddChol_Choix2_14012019.csv")
+write.csv(nhanes,"JddChol_Choix3_22012019.csv") #avec les variables plomb dans le sang mais seulement 2606indiv
+
+####################################################################################################
+## LUI APPLIQUER LA TRANSCODIFICATION D'Yfan
+####################################################################################################
+
+
+
+
+
+
+
+
+
+####################################################################################################
+## LUI APPLIQUER LA METHODE MICE D'IMPUTATION DES NAs
+####################################################################################################
+library(mice)
+library(VIM)
+library(data.table)
+
+# nhanes_chol <- nhanes
+# don <- nhanes_chol
+
+don <- read.csv("JddChol_Choix2_14012019.csv", sep = ",")
+#don <- read.csv("JddChol_Choix3_22012019.csv", sep = ",") #avec les variables plomb dans le sang mais seulement 2606indiv
+
+colnames(don)
+
+# COMMENT CHOISIR LES VAR A SUPPRIMER APRES LE PLOT DE VIM ??
+aggr_plot <- aggr(don, col=c('navyblue','red'), numbers=TRUE, sortVars=TRUE,
+                  labels=names(data), cex.axis=.7, gap=3,
+                  ylab=c("Histogram of missing data","Pattern"))
+
+# Remplacement des valeurs NA ?? l'aide de la m??thode Mice
+tail(md.pattern(don))
+md.pairs(don)
+imp<-mice(don)
+#imp <- mice(don,m=1,seed=1234) #cr?er juste 1 valeur d'imputation : plus rapide, en attendant le param de MICE!
+
+summary(imp)
+imp$imp$INDFMPIR_demo # les 5 valeurs d'imputation propos??es par MICE 
+
+don2<-complete(imp)
+
+don2$INDFMPIR_demo # par d??faut MICE imput avec la 1ere valeur qui n'est pas forcement pertinente : param de MICE pour choisir la moy entre les 5 valeurs ??
+summary(don2)
+dim(don2) #5470x93
+table(apply(don2,2,function (x) {sum(is.na(x))})>0)
+
+# le fichier de sortie
+write.csv(don2,"JddChol_Choix2_MICE_14012019.csv")
+#write.csv(don2,"JddChol_Choix3_MICE_22012019.csv") #avec les variables plomb dans le sang mais seulement 2606indiv
+
+####################################################################################################
+## ANALYSER LES DIFFERENTES METHODES DE MODELISATION POUR PREDIRE LE CHOLESTEROL
+####################################################################################################
+library(glmnet)#contrainte
+library(randomForest)#Foret
+library(gbm)#Boosting
+library(e1071)#SVM
+library(rpart)#Arbre
+library(foreach)#parallel
+
+# REUTILISER LE CODE AVEC LES DIFFERENTS JDD CHOLESTEROL
+# Jdd Choix 1
+#don <- read.csv("JDonneesCholesterol_MICE_05012019.csv")
+# Jdd Choix 2
+don <- read.csv("JddChol_Choix2_MICE_14012019.csv")
+# Jdd Choix 3
+#don <- read.csv("JddChol_Choix3_MICE_22012019.csv") #avec les variables plomb dans le sang mais seulement 2606indiv
+
+colnames(don)
+don$X <- NULL
+
+#Choix 1 : utiliser BPQ080_bpq
+
+#Choix 2 : utiliser nhanes.y
+don[don$nhanes.y=="2",93]<-c("0")
+don[don$nhanes.y=="1",93]<-c("1")
+don[don$nhanes.y=="9",93]<-c("0")
+don$nhanes.y <- as.numeric(don$nhanes.y)
+str(don) # avant c'??tait CHAR
+
+XX <- as.matrix(model.matrix(~.,don)[,-ncol(model.matrix(~.,don))])
+YY <- as.matrix(model.matrix(~.,don)[,ncol(model.matrix(~.,don))])
+
+bloc <- 4
+ind= sample(1:nrow(don) %% 4+1)
+res <- data.frame(Y=don$nhanes.y, log=0, ridge=0, lasso=0, elastic=0,
+                  foret=0, adabo=0, logibo=0, svm=0, pm=0, arbre=0)
+set.seed(1234)
+deb <-   Sys.time()
+
+foreach (i = 1:bloc, .packages = c("gbm","e1071","glmnet","randomForest", "rpart")) %dopar% {
+  
+  # Logistique
+  mod <- glm(nhanes.y~.,data=don[ind!=i,],family="binomial")
+  res[ind==i,"log"] <- predict(mod,don[ind==i,],type="response")
+  
+  XXA <- XX[ind!=i,]
+  YYA <- YY[ind!=i,]
+  XXT <- XX[ind==i,]
+  # Ridge
+  tmp <- cv.glmnet(XXA,YYA,alpha=0,family="binomial")
+  mod <- glmnet(XXA,YYA,alpha=0,lambda=tmp$lambda.min, family="binomial")
+  res[ind==i,"ridge"] <- predict(mod,newx=XXT,type="response")
+
+  # Lass0
+  tmp <- cv.glmnet(XXA,YYA, alpha=1, family="binomial")
+  mod <- glmnet(XXA,YYA,alpha=1, lambda =tmp$lambda.1se,family="binomial" )
+  res[ind==i,"lasso"] <- predict(mod,newx=XXT, type="response")
+
+  # Elasticnet
+  tmp <- cv.glmnet(XXA,YYA, alpha=0.5, family="binomial")
+  mod <- glmnet(XXA,YYA,alpha = 0.5, lambda = tmp$lambda.min, family="binomial")
+  res[ind==i,"elastic"] <- predict(mod,newx=XXT,type="response")
+
+  # Foret
+  mod <- randomForest(XXA,YYA)
+  res[ind==i,"foret"] <- predict(mod,XX[ind==i,])
+  
+  # # Adaboost
+  # tmp <- gbm((nhanes.y)~.,data = don[ind!=i,], distribution = "adaboost", interaction.depth = 2,
+  #            shrinkage = 0.1,n.trees = 500)
+  # M <- gbm.perf(tmp)[1]
+  # mod <- gbm((nhanes.y)~.,data = don[ind!=i,], distribution = "adaboost", interaction.depth = 2,
+  #            shrinkage = 0.1,n.trees = M)
+  # res[ind==i, "adabo"] <- predict(mod, newdata=don[ind==i,], type = "response", n.trees = M)
+  # 
+  # # Logiboost
+  # tmp <- gbm((nhanes.y)~.,data=don[ind!=i,], distribution="bernoulli", interaction.depth = 2,
+  #            shrinkage=0.1,n.trees=500)
+  # M <- gbm.perf(tmp)[1]
+  # mod <- gbm((nhanes.y)~.,data=don[ind!=i,], distribution="bernoulli", interaction.depth = 2,
+  #            shrinkage=0.1,n.trees=M)
+  # res[ind==i, "logibo"] <- predict(mod,newdata=don[ind==i,], type= "response", n.trees = M)
+  # 
+  # # SVM
+  # mod <- svm(nhanes.y~.,data=don[ind!=i,], kernel="linear",probability=T)
+  # res[ind==i,"svm"] <- attr(predict(mod,newdata = don[ind==i,],probability = T),"probabilities")[,2]
+  # 
+  # # Arbre 
+  # mod <- rpart(XXA,YYA)
+  # res[ind==i,"arbre"] <- predict(mod,XX[ind==i,])
+  
+}
+fin <- Sys.time()
+fin-deb
+
+############################################
+# Perceptron multicouche
+############################################
+# library(keras)
+# 
+# for (i in 1:bloc){
+#   
+#   # instanciation du model
+#   pm.keras <- keras_model_sequential()
+#   
+#   # architecture
+#   pm.keras %>%
+#     layer_dense(units = 2, input_shape=ncol(XXA), activation = "sigmoid") %>%
+#     layer_dense(units = 1, activation = "sigmoid")
+#   
+#   # configuration de l'apprentissage
+#   pm.keras %>% compile(
+#     loss="mean_squared_error",
+#     optimizer="sgd",
+#     metrics="mae"
+#   )
+#   
+#   # lancement de l'apprentissage
+#   pm.keras %>% fit(
+#     XXA <- XX[ind!=i,],
+#     YYA <- YY[ind!=i,],
+#     epochs=80,
+#     batch_size=8
+#   )
+#   
+#   # proba prediction
+#   res[ind==i,"pm"] <- pm.keras %>% predict(XX[ind==i,])
+# }
+
+
+############################################
+# Logistique avec STEP
+############################################
+
+# Logistique avec STEP
+# null=glm(DIQ010_diq~1, data=nhanes3,family=binomial)
+# null
+# full=glm(DIQ010_diq~., data=nhanes3,family=binomial)
+# full
+# 
+# bestmodel=step(null, scope=list(lower=null, upper=full), direction="forward")
+# summary(bestmodel)
+# 
+# for(i in 1:bloc){
+#   RES[ind==i,"log"] <- predict(bestmodel,nhanes3[ind==i,],type="response")
+# }
+
+#####################################################
+# Evaluation des mod??les avec les erreurs et courbes
+#####################################################
+
+monerreur <- function(X, Y, seuil=0.5){
+  table(cut(X, breaks = c(0,seuil,1)), Y)
+}
+
+# matrice de confusion
+monerreur(res[,2],res[,1])#log
+monerreur(res[,3],res[,1])#Ridge
+monerreur(res[,4],res[,1])#Lasso
+monerreur(res[,5],res[,1])#Elastic
+monerreur(res[,6],res[,1])#Foret
+# monerreur(res[,7],res[,1])#Adabo
+# monerreur(res[,8],res[,1])#Logibo
+# monerreur(res[,9],res[,1])#SVM
+# monerreur(res[,10],res[,1])#perceptron
+# monerreur(res[,11],res[,1])#arbre
+
+library(pROC)
+# erreur
+monerreurb <- function(X,Y,seuil=0.5){
+  Xc <- cut(X,breaks=c(0,seuil,1),labels=c(0,1))
+  sum(as.factor(Y)!=Xc)
+}
+apply(res[,-1],2,monerreurb,Y=res[,1],seuil=0.5)
+
+
+auc(res[,1],res[,2])#log
+auc(res[,1],res[,3])#Ridge
+auc(res[,1],res[,4])#Lasso
+auc(res[,1],res[,5])#Elastic
+auc(res[,1],res[,6])#Foret
+# auc(res[,1],res[,7])#Adabo
+# auc(res[,1],res[,8])#Logibo
+# auc(res[,1],res[,9])#SVM
+# auc(res[,1],res[,10])#perceptron
+# auc(res[,1],res[,11])#arbre
+
+plot(roc(res[,1],res[,2]))#log
+lines(roc(res[,1],res[,3]), col="red")#Ridge
+lines(roc(res[,1],res[,4]), col="blue")#Lasso
+lines(roc(res[,1],res[,5]), col="green")#Elastic
+lines(roc(res[,1],res[,6]), col="brown")#Foret 
+# lines(roc(res[,1],res[,7]), col="yellow")#Adabo
+# lines(roc(res[,1],res[,8]), col="purple")#Logibo
+# lines(roc(res[,1],res[,9]), col="grey")#SVM
+# lines(roc(res[,1],res[,9]), col="black")#perceptron
+# lines(roc(res[,1],res[,9]), col="orange")#arbre
+
+
+###############################################################################################################
+## UNE PREMIERE SYNTHESE DES MODELES
+###############################################################################################################
+
+## Comparatif des auc, faux positifs et courbes Roc
+
+
+## Jdd Choix 2 Logistique
+#summary(mod)
+# Variables explicatives :
+#
+
+## Jdd Choix 2 Logistique avec Step
+#summary(bestmodel)
+# Variables explicatives :
+#
+```
+
